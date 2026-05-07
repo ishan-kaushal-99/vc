@@ -41,11 +41,39 @@ app.prepare().then(() => {
       cb({ ok: true, code });
     });
 
-   socket.on('join-room', ({ name, code }, cb) => {
+    socket.on('join-room', ({ name, code }, cb) => {
       const c = (code || '').toUpperCase().trim();
       if (!ROOMS[c]) return cb({ ok: false, error: 'Room not found.' });
       _join(socket, io, c, name, false);
       cb({ ok: true, code: c });
+    });
+
+    /*
+      Home page joins the socket room before Next.js navigates to /call/[code].
+      The server already emitted `joined` while no listener existed on the client.
+      The call page emits this so we replay `joined` (same payload as _join).
+    */
+    socket.on('call-sync', (payload, cb) => {
+      const c = (payload?.code || '').toString().toUpperCase().trim();
+      if (!c || !ROOMS[c] || socket._room !== c) {
+        if (typeof cb === 'function') cb({ ok: false });
+        return;
+      }
+      const room = ROOMS[c];
+      const me = room.participants.find(p => p.id === socket.id);
+      if (!me) {
+        if (typeof cb === 'function') cb({ ok: false });
+        return;
+      }
+      const existing = room.participants.filter(p => p.id !== socket.id).map(p => ({ id: p.id, name: p.name }));
+      socket.emit('joined', {
+        myId: socket.id,
+        code: c,
+        isAdmin: me.isAdmin,
+        participants: room.participants,
+        callThese: existing,
+      });
+      if (typeof cb === 'function') cb({ ok: true });
     });
 
     socket.on('offer', ({ to, offer }) => {

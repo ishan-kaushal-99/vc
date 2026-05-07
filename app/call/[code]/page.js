@@ -6,6 +6,23 @@ import Sidebar from '../../../components/Sidebar';
 
 const STUN = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
+function attachStream(videoEl, stream) {
+  if (!videoEl || !stream) return;
+
+  if (videoEl.srcObject !== stream) {
+    videoEl.srcObject = stream;
+  }
+
+  const tryPlay = () => {
+    const playPromise = videoEl.play?.();
+    if (playPromise && typeof playPromise.catch === 'function') {
+      playPromise.catch(() => {});
+    }
+  };
+  tryPlay();
+  requestAnimationFrame(tryPlay);
+}
+
 export default function CallPage() {
   const { code }  = useParams();
   const router    = useRouter();
@@ -42,6 +59,9 @@ export default function CallPage() {
     const pc = new RTCPeerConnection(STUN);
     pcs.current[remoteId] = pc;
 
+    // Only addTrack — pairing addTransceiver + addTrack duplicates m-lines and often breaks
+    // inbound video for the offerer while the answerer still receives fine.
+
     // Add our local tracks so the remote peer gets our video/audio
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(t =>
@@ -51,9 +71,15 @@ export default function CallPage() {
 
     // When we receive the remote stream
     pc.ontrack = (e) => {
-      const stream = e.streams[0];
-      if (!stream) return;
-      setRemoteStreams(prev => ({ ...prev, [remoteId]: stream }));
+      const track = e.track;
+      if (!track) return;
+
+      setRemoteStreams(prev => {
+        const currentStream = prev[remoteId];
+        const nextStream = new MediaStream(currentStream ? currentStream.getTracks() : []);
+        if (!nextStream.getTracks().some(t => t.id === track.id)) nextStream.addTrack(track);
+        return { ...prev, [remoteId]: nextStream };
+      });
     };
 
     // Send ICE candidates through the signalling server
@@ -74,7 +100,8 @@ export default function CallPage() {
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         if (!active) { stream.getTracks().forEach(t => t.stop()); return; }
         localStreamRef.current = stream;
-        if (myVideoRef.current) myVideoRef.current.srcObject = stream;
+        // myVideoRef may point at the wrong tile until `isAdmin` is known (call-sync); LocalPreview effect re-attaches.
+        attachStream(myVideoRef.current, stream);
       } catch (e) {
         console.warn('Camera error:', e.message);
       }
@@ -166,6 +193,9 @@ export default function CallPage() {
           setKicked(true);
           setTimeout(() => router.push('/'), 2500);
         });
+
+        const roomCode = (Array.isArray(code) ? code[0] : code || '').toString().toUpperCase().trim();
+        if (roomCode) sock.emit('call-sync', { code: roomCode });
       }
 
       if (sock.connected) attach(); else sock.once('connect', attach);
@@ -182,18 +212,24 @@ export default function CallPage() {
       ['joined','offer','answer','ice','peer-left','room-peers','peer-media','you-are-admin','kicked']
         .forEach(ev => s.off(ev));
     };
-  }, []);
+  }, [code]);
 
   // ── Attach host's remote stream to hostVideoRef ───────────────
   // We find who is admin from participants, then get their stream
   const hostParticipant = participants.find(p => p.isAdmin && p.id !== myId);
-  const hostStream      = hostParticipant ? remoteStreams[hostParticipant.id] : null;
+  const hostStream      = hostParticipant ? remoteStreams[hostParticipant.id] : Object.values(remoteStreams)[0] || null;
 
   useEffect(() => {
-    if (hostVideoRef.current && hostStream) {
-      hostVideoRef.current.srcObject = hostStream;
-    }
-  }, [hostStream]);
+    attachStream(hostVideoRef.current, hostStream);
+  }, [hostStream, hostParticipant?.id]);
+
+  // Local preview uses one ref on either left (admin) or right (participant). After call-sync, `isAdmin` can flip
+  // and React mounts a new <video>; re-attach so the admin always sees their camera on the left.
+  useEffect(() => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    attachStream(myVideoRef.current, stream);
+  }, [isAdmin]);
 
   // ── Controls ──────────────────────────────────────────────────
   function toggleMute() {
@@ -354,7 +390,7 @@ function AdminFirstParticipant({ remoteStreams, participants, peerMedia, myId })
 function RemoteVideoBox({ stream, name, media }) {
   const vRef = useRef(null);
   useEffect(() => {
-    if (vRef.current && stream) vRef.current.srcObject = stream;
+    attachStream(vRef.current, stream);
   }, [stream]);
   return (
     <>
